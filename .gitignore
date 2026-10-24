@@ -1,0 +1,9 @@
+# 影片素材與成品不進版本庫
+input/
+test/
+output/
+*.mp4
+*.mov
+*.wav
+.DS_Store
+__pycache__/

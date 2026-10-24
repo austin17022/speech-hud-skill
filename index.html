@@ -1,0 +1,1281 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 演講分析 HUD</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#02070d;--panel:#06131d;--line:#143a4e;--cyan:#2de2ff;--text:#dff8ff;--dim:#7fa9b8}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,"PingFang TC",sans-serif}
+.app{display:flex;height:100vh;gap:24px;padding:20px}
+.side{width:340px;flex:none;display:flex;flex-direction:column;gap:14px;overflow:auto;padding-right:4px}
+.stage{flex:1;display:flex;align-items:center;justify-content:center;min-width:0}
+canvas#out{height:calc(100vh - 40px);max-width:100%;aspect-ratio:9/16;border:1px solid var(--line);border-radius:8px;cursor:crosshair;background:#000}
+h1{font-size:20px;margin:0}
+.sub{color:var(--dim);font-size:13px;line-height:1.6;margin:0}
+label{display:block;font-size:13px;color:var(--dim);margin-bottom:4px}
+input[type=text]{width:100%;padding:9px 10px;background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:6px;font-size:14px}
+input[type=text]:focus{outline:none;border-color:var(--cyan)}
+button{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;padding:11px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--text);font-size:14px;cursor:pointer}
+button:hover:not(:disabled){border-color:var(--cyan)}
+button.primary{background:var(--cyan);color:#001018;border-color:var(--cyan);font-weight:700}
+button.rec{background:#ff3d5a;border-color:#ff3d5a;color:#fff;font-weight:700}
+button:disabled{opacity:.4;cursor:not-allowed}
+.row{display:flex;gap:8px}
+.drop{border:1px dashed var(--line);border-radius:8px;padding:18px;text-align:center;color:var(--dim);font-size:13px;cursor:pointer;line-height:1.6}
+.drop.over{border-color:var(--cyan);color:var(--cyan)}
+#status{font-size:13px;color:var(--cyan);min-height:20px;line-height:1.6;word-break:break-all}
+#status a{color:var(--cyan)}
+ol{margin:0;padding-left:18px;color:var(--dim);font-size:13px;line-height:1.8}
+video#src{position:fixed;left:0;top:0;width:2px;height:2px;opacity:0;pointer-events:none}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="side">
+    <div>
+      <h1>AI 演講分析 HUD</h1>
+      <p class="sub">分析演講影片裡的眼神、手勢、表情和聲音，輸出直式 9:16 影片。</p>
+    </div>
+    <ol>
+      <li>上傳影片</li>
+      <li>在畫面上點一下主角，鎖定分析對象</li>
+      <li>按「錄製成品」，播完會自動存檔</li>
+    </ol>
+    <div class="drop" id="drop">把影片拖進來，或點這裡選檔<br><span style="font-size:12px">mp4 / mov / webm</span></div>
+    <input type="file" id="file" accept="video/*" hidden>
+    <div><label>標題（影片最上面）</label><input type="text" id="title" value="AI 即時肢體語言分析"></div>
+    <div><label>主角名字</label><input type="text" id="name" value="" placeholder="例如：沈伯洋"></div>
+    <div><label>你的帳號（右下角浮水印）</label><input type="text" id="handle" value="" placeholder="@你的帳號"></div>
+    <div class="row">
+      <button id="play" disabled>▶ 預覽</button>
+      <button id="relock" disabled>重新鎖定</button>
+    </div>
+    <button id="record" class="rec" disabled>● 錄製成品</button>
+    <div id="status">載入 AI 模型中…</div>
+  </div>
+  <div class="stage"><canvas id="out" width="1080" height="1920"></canvas></div>
+</div>
+<video id="src" playsinline preload="auto"></video>
+
+<script type="module">
+import {FilesetResolver, FaceLandmarker, HandLandmarker, PoseLandmarker} from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+// ───────── 版面 ─────────
+const W = 1080, H = 1920;
+const VP = {x: 0, y: 200, w: 1080, h: 960};    // 影像區
+const DY = 1160;                                // 儀表板起點
+const ORIG_SEC = 1.2, INTRO_SEC = 1.0;          // 開頭原始畫面、掃描轉場的秒數
+const C = {
+  bg: '#02070d', cyan: '#2de2ff', cyanD: 'rgba(45,226,255,.35)', cyanF: 'rgba(45,226,255,.12)',
+  text: '#e6fbff', dim: '#6f97a6', orange: '#ff9a3d', red: '#ff3d5a', green: '#3dffb0', violet: '#b388ff', amber: '#ffc53d', pink: '#ff6ad5'
+};
+const F = {
+  num: (s, w = 700) => `${w} ${s}px Orbitron, "PingFang TC", sans-serif`,
+  mono: s => `${s}px "Share Tech Mono", "PingFang TC", monospace`,
+  zh: (s, w = 600) => `${w} ${s}px "PingFang TC", "Noto Sans TC", sans-serif`,
+};
+
+const $ = id => document.getElementById(id);
+const canvas = $('out'), ctx = canvas.getContext('2d');
+const video = $('src');
+const headCv = new OffscreenCanvas(256, 256), hctx = headCv.getContext('2d');
+const bodyCv = new OffscreenCanvas(384, 384), bctx = bodyCv.getContext('2d');
+const subjCv = new OffscreenCanvas(512, 512), subjCtx = subjCv.getContext('2d');
+const setStatus = html => { $('status').innerHTML = html; };
+
+// ───────── 模型 ─────────
+let face, hand, pose, poseC;
+async function loadModels() {
+  const fs = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  const base = 'https://storage.googleapis.com/mediapipe-models';
+  let delegate = 'GPU';
+  const opt = (path, mode = 'VIDEO') => ({baseOptions: {modelAssetPath: `${base}/${path}`, delegate}, runningMode: mode});
+  const create = () => Promise.all([
+    PoseLandmarker.createFromOptions(fs, {...opt('pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task', 'IMAGE'), numPoses: 6, minPoseDetectionConfidence: 0.4}),
+    FaceLandmarker.createFromOptions(fs, {...opt('face_landmarker/face_landmarker/float16/1/face_landmarker.task'), numFaces: 1, outputFaceBlendshapes: true, minFaceDetectionConfidence: 0.3}),
+    HandLandmarker.createFromOptions(fs, {...opt('hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'), numHands: 2, minHandDetectionConfidence: 0.35}),
+  ]);
+  const createC = () => PoseLandmarker.createFromOptions(fs, {...opt('pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task', 'IMAGE'), numPoses: 1, minPoseDetectionConfidence: 0.3});
+  try { [pose, face, hand] = await create(); poseC = await createC(); }
+  catch { delegate = 'CPU'; [pose, face, hand] = await create(); poseC = await createC(); }   // 顯示卡不支援就改用處理器
+}
+
+// ───────── 六種狀態：每種由幾個底層訊號加權（! 代表反向）─────────
+const STATES = [
+  {key: 'conf', zh: '自信', en: 'CONFIDENCE', col: '#2de2ff', w: [['eye', .22], ['headUp', .12], ['open', .14], ['gesture', .12], ['steady', .1], ['tone', .1], ['pace', .1], ['smile', .1], ['!pause', .15]],
+   line: '眼神穩、手勢自然，掌控全場'},
+  {key: 'stress', zh: '壓力', en: 'STRESS', col: '#ff5a6e', w: [['blink', .16], ['lip', .12], ['shrug', .12], ['sway', .12], ['tremor', .12], ['touch', .16], ['brow', .1], ['fast', .1], ['pause', .16], ['longPause', .14]],
+   line: '說話卡頓、眨眼偏多，透露出緊張'},
+  {key: 'hes', zh: '遲疑', en: 'HESITATION', col: '#b388ff', w: [['pause', .25], ['longPause', .2], ['slow', .15], ['away', .15], ['headDown', .1], ['still', .1], ['touch', .05]],
+   line: '停頓和視線飄移偏多，說話有所保留'},
+  {key: 'def', zh: '防備', en: 'DEFENSIVE', col: '#ffc53d', w: [['closed', .3], ['lip', .15], ['brow', .15], ['headDown', .15], ['away', .1], ['!open', .15]],
+   line: '雙手收在身前，姿態偏封閉'},
+  {key: 'ent', zh: '熱情', en: 'ENTHUSIASM', col: '#ff6ad5', w: [['gesture', .25], ['tone', .2], ['smile', .2], ['emph', .15], ['open', .1], ['fast', .1]],
+   line: '手勢大、語調起伏豐富，很有感染力'},
+  {key: 'calm', zh: '從容', en: 'COMPOSURE', col: '#3dffb0', w: [['steady', .2], ['!sway', .15], ['!blink', .15], ['pace', .1], ['!touch', .1], ['!lip', .1], ['eye', .15], ['!pause', .22], ['!longPause', .15]],
+   line: '節奏穩定、表情放鬆，不慌不忙'},
+];
+
+// ───────── 狀態 ─────────
+const S = {
+  phase: 'idle',          // idle | intro | play | report
+  phaseStart: 0,
+  people: [], subject: null, lost: 0,
+  lock: null, lockInit: null, manualLock: false,
+  face: null, hands: [], headCrop: null, bodyCrop: null,
+  cam: {cx: 0, cy: 0, s: 1}, camInit: false,
+  needDetect: false, lastVT: -1, lastTs: 0,
+  recording: false, offline: false, vclock: 0,
+};
+let M; // 指標
+function resetMetrics() {
+  M = {
+    t0: null, eye: [], blinks: [], blinkClosed: false, lastBlink: -9,
+    touches: 0, touchFrames: 0, lastTouch: -9, touchRecent: 0, touchFlash: -9,
+    gestures: 0, moving: [], moveFrames: 0, lastGesture: -9, ripples: [],
+    lipPress: 0, brow: 0, smile: 0, smileOn: false, lastSmileEv: -9,
+    headX: [], awaySince: null, awayLogged: false,
+    yaw: 0, pitch: 0, gazeLabel: '—', exprLabel: '—',
+    events: [], hist: [],
+    raw: {}, disp: {}, f: {}, ready: false,
+    prevWrist: {}, swayN: 0, smiles: 0, headUp: 0.5,
+    open: 0.35, closed: 0, closedFrames: 0, closedCount: 0, lastClosed: -9,
+    neckBase: null, shrug: 0, shrugOn: false, lastShrug: -9, longPauses: 0,
+    blinkRate: 0, pauseR: 0,
+  };
+  A.pauses = []; A.pitches = []; A.silentSince = null; A.pauseLogged = false; A.peak = 0.02;
+  A.syl = []; A.lastSyl = -9; A.e1 = A.e2 = 0; A.rate = 0; A.range = 0; A.longPause = 0; A.emphRecent = 0;
+  A.stab = 0.75; A.rmsAvg = 0.03; A.lastEmph = -9;
+}
+
+// ───────── 聲音 ─────────
+const A = {ctx: null, an: null, dest: null, buf: new Float32Array(2048), sr: 48000, pcm: null, rms: 0, rmsAvg: 0.03, lastEmph: -9, f0: 0, stab: 0.75, pauses: [], pitches: [], peak: 0.02, wave: new Float32Array(2048)};
+const clockNow = () => S.offline ? S.vclock : performance.now();
+function ensureAudio() {
+  if (A.ctx) return;
+  A.ctx = new AudioContext();
+  const src = A.ctx.createMediaElementSource(video);
+  A.an = A.ctx.createAnalyser(); A.an.fftSize = 2048;
+  A.dest = A.ctx.createMediaStreamDestination();
+  src.connect(A.an); A.an.connect(A.ctx.destination); src.connect(A.dest);
+  A.sr = A.ctx.sampleRate;
+}
+function audioTick(t) {
+  if (S.offline) {
+    if (!A.pcm) return;
+    const c = Math.floor(t * A.sr) - 1024;
+    for (let i = 0; i < 2048; i++) { const j = c + i; A.buf[i] = j >= 0 && j < A.pcm.length ? A.pcm[j] : 0; }
+  } else {
+    if (!A.an) return;
+    A.an.getFloatTimeDomainData(A.buf);
+  }
+  A.wave.set(A.buf);
+  if (!S.offline && video.paused) { A.rms *= 0.9; return; }
+  let e = 0; for (const v of A.buf) e += v * v;
+  const rms = Math.sqrt(e / A.buf.length);
+  A.rms = rms; A.peak = Math.max(A.peak * 0.997, rms);
+  if (M.ready && rms > 0.05 && rms > A.rmsAvg * 1.9 && t - A.lastEmph > 2.5) { logEvent(t, '語氣加重', C.pink); A.lastEmph = t; A.emphRecent = 1; }
+  A.emphRecent *= 0.985; A.longPause *= 0.985;
+  A.rmsAvg = lerp(A.rmsAvg, rms, 0.03);
+  const speaking = rms > Math.max(0.012, A.peak * 0.18);
+  A.pauses.push({t, v: speaking ? 0 : 1});
+  prune(A.pauses, t, 8);
+  // 語速：音量起伏的波峰約等於一個音節（中文一字一音節）
+  if (A.e1 > A.e2 && A.e1 >= rms && A.e1 > Math.max(0.02, A.peak * 0.22) && t - A.lastSyl > 0.1) { A.syl.push({t, v: 1}); A.lastSyl = t; }
+  A.e2 = A.e1; A.e1 = rms;
+  prune(A.syl, t, 5);
+  const recent = A.pauses.filter(p => p.t > t - 5);
+  const speakSec = (1 - avg(recent)) * (recent.length ? t - recent[0].t : 0);
+  if (speakSec > 1) A.rate = A.rate ? lerp(A.rate, A.syl.length / speakSec, 0.08) : A.syl.length / speakSec;
+  if (!speaking) {
+    if (A.silentSince == null) A.silentSince = t;
+    if (!A.pauseLogged && t - A.silentSince > 1.2 && M.ready) { logEvent(t, '長停頓：遲疑訊號', C.violet); A.pauseLogged = true; A.longPause = 1; M.longPauses++; }
+  } else { A.silentSince = null; A.pauseLogged = false; }
+  A.f0 = speaking ? pitchOf(A.buf, A.sr) : 0;
+  if (A.f0) {
+    A.pitches.push({t, v: 12 * Math.log2(A.f0 / 100)});
+    prune(A.pitches, t, 5);
+    if (A.pitches.length > 10) {
+      const v = A.pitches.map(o => o.v).sort((a, b) => a - b);
+      A.range = lerp(A.range, v[Math.floor(v.length * 0.9)] - v[Math.floor(v.length * 0.1)], 0.1);
+    }
+    if (A.pitches.length > 6) {
+      let j = 0; for (let i = 1; i < A.pitches.length; i++) j += Math.min(3, Math.abs(A.pitches[i].v - A.pitches[i - 1].v));
+      j /= A.pitches.length - 1;
+      A.stab += (clamp(1 - (j - 0.25) / 1.6) - A.stab) * 0.05;
+    }
+  }
+}
+function pitchOf(buf, sr) {
+  const minLag = Math.floor(sr / 400), maxLag = Math.floor(sr / 75), N = buf.length - maxLag;
+  let best = 0, bestLag = 0;
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let s = 0, e1 = 0, e2 = 0;
+    for (let i = 0; i < N; i += 2) { const a = buf[i], b = buf[i + lag]; s += a * b; e1 += a * a; e2 += b * b; }
+    const c = s / Math.sqrt(e1 * e2 + 1e-9);
+    if (c > best) { best = c; bestLag = lag; }
+  }
+  return best > 0.55 ? sr / bestLag : 0;
+}
+
+// ───────── 小工具 ─────────
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, k) => a + (b - a) * k;
+const prune = (arr, t, win) => { while (arr.length && (arr[0].t < t - win || arr[0].t > t + 0.5)) arr.shift(); };
+const avg = arr => arr.length ? arr.reduce((s, o) => s + o.v, 0) / arr.length : 0;
+const fmtT = t => { t = Math.max(0, t); const m = Math.floor(t / 60), s = t - m * 60; return `${String(m).padStart(2, '0')}:${s.toFixed(1).padStart(4, '0')}`; };
+const bs = (cats, name) => { const c = cats.find(c => c.categoryName === name); return c ? c.score : 0; };
+function logEvent(t, text, color) { M.events.push({t, text, color, born: clockNow()}); if (M.events.length > 30) M.events.shift(); }
+
+// ───────── 偵測 ─────────
+function detect() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return;
+  const ts = S.lastTs = Math.max(performance.now(), S.lastTs + 1);
+  const t = video.currentTime;
+
+  // 1. 全身骨架：找出畫面裡每個人
+  const pr = pose.detect(video);
+  S.people = pr.landmarks.map(lm => mkPerson(lm.map(p => ({x: p.x * vw, y: p.y * vh, v: p.visibility ?? 1}))));
+
+  // 1b. 全畫面常漏抓主角：把主角附近放大，單獨再找一次
+  let near = [];
+  if (S.lock && S.refSw) {
+    // 窄長條：只框主角一個人的寬度，左右補黑，旁邊的人進不來
+    const ch = S.refSw * 5, cw = S.refSw * 2.2, ox = S.lock.x - cw / 2, oy = S.lock.y - S.refSw * 0.7;
+    const k = 512 / ch, pad = (512 - cw * k) / 2;
+    subjCtx.fillStyle = '#000'; subjCtx.fillRect(0, 0, 512, 512);
+    subjCtx.drawImage(video, ox, oy, cw, ch, pad, 0, cw * k, 512);
+    near = poseC.detect(subjCv).landmarks.map(lm => mkPerson(lm.map(p => ({x: ox + (p.x * 512 - pad) / k, y: oy + p.y * 512 / k, v: p.visibility ?? 1}))));
+  }
+
+  // 2. 鎖定主角
+  if (!S.lock && S.people.length) {
+    const best = S.people.slice().sort((a, b) => (b.sw - Math.abs(b.head.x - vw / 2) * 0.4) - (a.sw - Math.abs(a.head.x - vw / 2) * 0.4))[0];
+    S.lock = {...best.head};
+    if (!S.lockInit) S.lockInit = {...best.head};
+  }
+  // 認人：位置＋身形＋衣服顏色。短暫跟丟時只在附近找；跟丟久了（例如原影片鏡頭晃動）改用衣服顏色在全畫面找回來
+  S.near = near;
+  const cands = [...near, ...S.people];
+  signatures(cands, vw, vh);
+  let subj = null;
+  if (S.lock) {
+    const ref = S.refSw ?? null;
+    let best = Infinity;
+    for (const p of cands) {
+      const cd = S.refSig ? sigDist(p.sig, S.refSig) : 0;
+      const pd = Math.hypot(p.head.x - S.lock.x, p.head.y - S.lock.y) / (ref ?? p.sw);
+      const sizeOk = !ref || (p.sw > ref * 0.5 && p.sw < ref * 2);
+      let score;
+      if (S.lost < 8 || !S.refSig) { if (pd > 0.9 || cd > (pd < 0.4 ? 0.34 : 0.25) || !sizeOk) continue; score = pd + cd * 3; }   // 位置幾乎沒動時顏色門檻放寬（光線變化）
+      else { if (cd > 0.2) continue; score = cd * 3 + pd * 0.2; }
+      if (score < best) { best = score; subj = p; }
+    }
+  }
+  if (subj) {
+    S.subject = subj; S.lock = {...subj.head}; S.lost = 0; S.refSw = subj.sw;
+    if (!S.refSig) S.refSig = subj.sig.slice();
+    else if (sigDist(subj.sig, S.refSig) < 0.3) S.refSig = S.refSig.map((v, i) => lerp(v, subj.sig[i], 0.05));
+  } else if (++S.lost > 8) S.subject = null;
+  const P = S.subject;
+  if (!P) { S.face = null; S.hands = []; return; }
+
+  // 3. 放大頭部給臉部模型看
+  let hc;
+  if (S.face && S.lost === 0) {
+    const b = S.face.box;
+    hc = {cx: (b.x0 + b.x1) / 2, cy: (b.y0 + b.y1) / 2, s: Math.max(b.x1 - b.x0, b.y1 - b.y0) * 2.0};
+  } else hc = {cx: P.head.x, cy: P.head.y, s: P.sw * 1.25};
+  hc.s = Math.max(hc.s, 48);
+  S.headCrop = S.headCrop ? {cx: lerp(S.headCrop.cx, hc.cx, 0.5), cy: lerp(S.headCrop.cy, hc.cy, 0.5), s: lerp(S.headCrop.s, hc.s, 0.4)} : hc;
+  const H0 = S.headCrop, hx = H0.cx - H0.s / 2, hy = H0.cy - H0.s / 2;
+  hctx.fillStyle = '#000'; hctx.fillRect(0, 0, 256, 256);
+  hctx.drawImage(video, hx, hy, H0.s, H0.s, 0, 0, 256, 256);
+  const fr = face.detectForVideo(headCv, ts);
+  if (fr.faceLandmarks.length) {
+    const lmC = fr.faceLandmarks[0];
+    const lm = lmC.map(p => ({x: hx + p.x * H0.s, y: hy + p.y * H0.s}));
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    for (const p of lm) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
+    // 臉要長在主角骨架的頭上，大小也要合理，否則當作沒抓到
+    const fcx = (x0 + x1) / 2, fcy = (y0 + y1) / 2, fw = x1 - x0;
+    const onBody = Math.hypot(fcx - P.head.x, fcy - P.head.y) < P.sw * 0.45 && fw > P.sw * 0.22 && fw < P.sw * 1.1;
+    S.face = onBody ? {lm, lmC, cats: fr.faceBlendshapes[0]?.categories || [], box: {x0, y0, x1, y1}} : null;
+    if (!onBody) S.headCrop = null;
+  } else S.face = null;
+
+  // 4. 放大上半身給手部模型看
+  const bc = {cx: P.sh.x, cy: P.sh.y + P.sw * 0.55, s: P.sw * 2.8};
+  S.bodyCrop = S.bodyCrop ? {cx: lerp(S.bodyCrop.cx, bc.cx, 0.5), cy: lerp(S.bodyCrop.cy, bc.cy, 0.5), s: lerp(S.bodyCrop.s, bc.s, 0.4)} : bc;
+  const B0 = S.bodyCrop, bx = B0.cx - B0.s / 2, by = B0.cy - B0.s / 2;
+  bctx.fillStyle = '#000'; bctx.fillRect(0, 0, 384, 384);
+  bctx.drawImage(video, bx, by, B0.s, B0.s, 0, 0, 384, 384);
+  const hr = hand.detectForVideo(bodyCv, ts);
+  S.hands = hr.landmarks.map(lm => lm.map(p => ({x: bx + p.x * B0.s, y: by + p.y * B0.s})))
+    .filter(h => [15, 16].some(i => P.pts[i].v < 0.4 || Math.hypot(P.pts[i].x - h[0].x, P.pts[i].y - h[0].y) < P.sw * 0.9));
+
+  if ((S.offline || !video.paused) && t !== S.lastVT && ['orig', 'intro', 'play'].includes(S.phase)) updateMetrics(t);
+  S.lastVT = t;
+}
+
+function mkPerson(pts) {
+  const n = pts[0], lE = pts[7], rE = pts[8], lS = pts[11], rS = pts[12];
+  const sw = Math.hypot(lS.x - rS.x, lS.y - rS.y), ew = Math.hypot(lE.x - rE.x, lE.y - rE.y);
+  return {pts, head: {x: (n.x + (lE.x + rE.x) / 2) / 2, y: (n.y + (lE.y + rE.y) / 2) / 2}, sw: Math.max(sw, ew * 2.5, 24), sh: {x: (lS.x + rS.x) / 2, y: (lS.y + rS.y) / 2}};
+}
+
+// ───────── 衣服顏色特徵（上衣＋褲子的平均色）─────────
+const sigCv = new OffscreenCanvas(160, 160), sctx = sigCv.getContext('2d', {willReadFrequently: true});
+function signatures(people, vw, vh) {
+  if (!people.length) return;
+  const w = 160, h = Math.round(160 * vh / vw), k = w / vw;
+  if (sigCv.height !== h) sigCv.height = h;
+  sctx.drawImage(video, 0, 0, w, h);
+  const data = sctx.getImageData(0, 0, w, h).data;
+  const mean = (x0, y0, x1, y1) => {
+    x0 = clamp(Math.round(x0 * k), 0, w - 1); x1 = clamp(Math.round(x1 * k), x0 + 1, w);
+    y0 = clamp(Math.round(y0 * k), 0, h - 1); y1 = clamp(Math.round(y1 * k), y0 + 1, h);
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { const i = (y * w + x) * 4; r += data[i]; g += data[i + 1]; b += data[i + 2]; n++; }
+    return [r / n, g / n, b / n];
+  };
+  for (const p of people) {
+    const q = p.pts, sx0 = Math.min(q[11].x, q[12].x), sx1 = Math.max(q[11].x, q[12].x), sy = p.sh.y;
+    const hipOk = q[23].v > 0.3 && q[24].v > 0.3;
+    const hy = hipOk ? (q[23].y + q[24].y) / 2 : sy + p.sw * 1.2;
+    const kneeOk = q[25].v > 0.3 && q[26].v > 0.3;
+    const ky = kneeOk ? (q[25].y + q[26].y) / 2 : hy + p.sw * 1.1;
+    const tw = sx1 - sx0, cx = (sx0 + sx1) / 2;
+    const torso = mean(sx0 + tw * 0.25, sy + (hy - sy) * 0.2, sx1 - tw * 0.25, hy - (hy - sy) * 0.15);
+    const legs = mean(cx - tw * 0.35, hy + (ky - hy) * 0.15, cx + tw * 0.35, ky - (ky - hy) * 0.1);
+    p.sig = [...torso, ...legs];
+  }
+}
+const sigDist = (a, b) => Math.sqrt(a.reduce((s, v, i) => s + (v - b[i]) ** 2, 0)) / (255 * Math.sqrt(6));
+
+// ───────── 指標計算 ─────────
+function updateMetrics(t) {
+  if (M.t0 == null) M.t0 = t;
+  const P = S.subject, Fc = S.face, el = t - M.t0;
+
+  // 頭部轉向、視線
+  if (Fc) {
+    const L = Fc.lm, n = L[1], a = L[234], b = L[454], top = L[10], chin = L[152];
+    const r = (n.x - a.x) / ((b.x - a.x) || 1);
+    const pr = (n.y - top.y) / ((chin.y - top.y) || 1);
+    M.yaw = lerp(M.yaw, clamp((r - 0.5) * 150, -85, 85), 0.3);
+    M.pitch = lerp(M.pitch, clamp((pr - 0.55) * 140, -60, 60), 0.3);
+    const cats = Fc.cats;
+    const lookAway = Math.max(bs(cats, 'eyeLookOutLeft'), bs(cats, 'eyeLookOutRight'), bs(cats, 'eyeLookDownLeft') * 0.8);
+    const contact = Math.abs(M.yaw) < 24 && M.pitch < 16 && lookAway < 0.55;
+    M.eye.push({t, v: contact ? 1 : 0}); prune(M.eye, t, 8);
+    M.headUp = lerp(M.headUp, clamp(1 - (M.pitch + 8) / 30), 0.1);
+    M.gazeLabel = contact ? '正視前方' : M.pitch >= 16 ? '往下看' : M.yaw < 0 ? '視線偏左' : '視線偏右';
+    if (!contact) {
+      if (M.awaySince == null) M.awaySince = t;
+      if (!M.awayLogged && t - M.awaySince > 1.6) { logEvent(t, '視線移開 1.5 秒以上', C.orange); M.awayLogged = true; }
+      M.contactSince = null; M.contactLogged = false;
+    } else {
+      M.awaySince = null; M.awayLogged = false;
+      if (M.contactSince == null) M.contactSince = t;
+      if (!M.contactLogged && t - M.contactSince > 3) { logEvent(t, '眼神穩定看向觀眾', C.green); M.contactLogged = true; }
+    }
+    if (Math.abs(M.yaw) > 28 && t - (M.lastTurn ?? -9) > 3) { logEvent(t, `轉頭看向${M.yaw < 0 ? '左' : '右'}側`, C.cyan); M.lastTurn = t; }
+
+    // 眨眼
+    const blink = (bs(cats, 'eyeBlinkLeft') + bs(cats, 'eyeBlinkRight')) / 2;
+    if (!M.blinkClosed && blink > 0.5 && t - M.lastBlink > 0.15) { M.blinkClosed = true; M.lastBlink = t; M.blinks.push({t, v: 1}); }
+    else if (M.blinkClosed && blink < 0.3) M.blinkClosed = false;
+    prune(M.blinks, t, 20);
+
+    // 表情
+    const press = clamp((bs(cats, 'mouthPressLeft') + bs(cats, 'mouthPressRight')) * 0.75 + (bs(cats, 'mouthRollLower') + bs(cats, 'mouthRollUpper')) * 0.5);
+    const brow = clamp((bs(cats, 'browDownLeft') + bs(cats, 'browDownRight')) / 2 + bs(cats, 'browInnerUp') * 0.4);
+    const sm = (bs(cats, 'mouthSmileLeft') + bs(cats, 'mouthSmileRight')) / 2;
+    const squint = (bs(cats, 'cheekSquintLeft') + bs(cats, 'cheekSquintRight') + bs(cats, 'eyeSquintLeft') + bs(cats, 'eyeSquintRight')) / 4;
+    const genuine = sm > 0.35 && squint > 0.18;
+    M.lipPress = lerp(M.lipPress, press, 0.1); M.brow = lerp(M.brow, brow, 0.1); M.smile = lerp(M.smile, genuine ? sm : sm * 0.3, 0.1);
+    if (genuine && !M.smileOn && t - M.lastSmileEv > 3) { logEvent(t, '真笑：眼角有一起動', C.green); M.lastSmileEv = t; M.smiles++; }
+    M.smileOn = genuine;
+    M.exprLabel = M.smile > 0.3 ? '微笑' : M.lipPress > 0.35 ? '抿嘴' : M.brow > 0.45 ? '皺眉' : '平靜';
+
+    // 摸臉：指尖進入鼻子以上的臉部範圍（拿麥克風在下巴不算）
+    const b0 = Fc.box, padX = (b0.x1 - b0.x0) * 0.12;
+    const zoneY1 = L[1].y + (L[152].y - L[1].y) * 0.15;
+    const tips = [];
+    for (const h of S.hands) for (const i of [4, 8, 12, 16, 20]) tips.push(h[i]);
+    if (P) for (const i of [19, 20]) if (P.pts[i].v > 0.6) tips.push(P.pts[i]);
+    const touching = tips.some(p => p.x > b0.x0 - padX && p.x < b0.x1 + padX && p.y > b0.y0 - (b0.y1 - b0.y0) * 0.15 && p.y < zoneY1);
+    M.touchFrames = touching ? M.touchFrames + 1 : 0;
+    if (M.touchFrames === 3 && t - M.lastTouch > 2) { M.touches++; M.lastTouch = t; M.touchFlash = t; M.touchRecent = 1; logEvent(t, '偵測到摸臉／撥頭髮', C.red); }
+  }
+  M.touchRecent *= 0.985;
+
+  // 手勢：手腕移動速度
+  if (P) {
+    let moving = false;
+    // 看 0.3 秒內的位移，避免骨架抖動被當成手勢
+    for (const i of [15, 16]) {
+      const w = P.pts[i], hist = M.prevWrist[i] ||= [];
+      if (w.v < 0.5) { hist.length = 0; continue; }
+      hist.push({x: w.x, y: w.y, t});
+      while (hist.length && (hist[0].t < t - 0.3 || hist[0].t > t)) hist.shift();
+      const a = hist[0], dt = t - a.t;
+      if (dt > 0.12) {
+        const sp = Math.hypot(w.x - a.x, w.y - a.y) / P.sw / dt;
+        if (sp > 0.9 && sp < 20) { moving = true; M.lastWrist = {x: w.x, y: w.y}; }
+      }
+    }
+    M.moving.push({t, v: moving ? 1 : 0}); prune(M.moving, t, 6);
+    M.moveFrames = moving ? M.moveFrames + 1 : 0;
+    if (M.moveFrames === 3 && t - M.lastGesture > 1.2) {
+      M.gestures++; M.lastGesture = t; logEvent(t, '手勢強調', C.cyan);
+      if (M.lastWrist) M.ripples.push({x: M.lastWrist.x, y: M.lastWrist.y, born: clockNow()});
+    }
+    // 身體晃動
+    M.headX.push({t, v: (P.head.x - P.sh.x) / P.sw}); prune(M.headX, t, 3);
+    const mu = avg(M.headX);
+    const sd = Math.sqrt(M.headX.reduce((s, o) => s + (o.v - mu) ** 2, 0) / Math.max(1, M.headX.length));
+    M.swayN = lerp(M.swayN, clamp(sd / 0.09), 0.1);
+
+    // 姿態：手打開在身體兩側算開放；兩手都收在身前（拿麥克風那隻在下巴不算）算封閉
+    const wl = P.pts[15], wr = P.pts[16];
+    if (wl.v > 0.4 && wr.v > 0.4) {
+      const spread = Math.abs(wl.x - wr.x) / P.sw;
+      const hipY = P.pts[23].v > 0.3 && P.pts[24].v > 0.3 ? (P.pts[23].y + P.pts[24].y) / 2 : P.sh.y + P.sw * 1.5;
+      const handsUp = (wl.y + wr.y) / 2 < hipY - P.sw * 0.1;
+      const front = Math.abs((wl.x + wr.x) / 2 - P.sh.x) < P.sw * 0.45;
+      M.open = lerp(M.open, handsUp ? clamp((spread - 0.5) / 1.0) : 0.35, 0.08);
+      const closedNow = handsUp && front && spread < 0.45 && Math.min(wl.y, wr.y) > P.sh.y + P.sw * 0.3;
+      M.closed = lerp(M.closed, closedNow ? 1 : 0, 0.06);
+      M.closedFrames = closedNow && !moving ? M.closedFrames + 1 : 0;
+      if (M.closedFrames === 20 && t - M.lastClosed > 4) { M.closedCount++; M.lastClosed = t; logEvent(t, '雙手收在身前：防備姿態', C.amber); }
+    }
+    // 聳肩：耳朵到肩膀的距離比平常短
+    const eL = P.pts[7], eR = P.pts[8];
+    if (eL.v > 0.5 && eR.v > 0.5) {
+      const neck = (P.sh.y - (eL.y + eR.y) / 2) / P.sw;
+      M.neckBase = M.neckBase == null ? neck : lerp(M.neckBase, neck, neck > M.neckBase ? 0.05 : 0.004);
+      const sh = clamp((M.neckBase - neck) / (Math.abs(M.neckBase) * 0.22 + 1e-3));
+      M.shrug = lerp(M.shrug, sh, 0.1);
+      if (sh > 0.7 && !M.shrugOn && t - M.lastShrug > 4) { logEvent(t, '聳肩：肩頸緊繃', C.red); M.lastShrug = t; }
+      M.shrugOn = sh > 0.7;
+    }
+  }
+
+  // 底層訊號（全部換算成 0～1）
+  const eye = M.eye.length ? avg(M.eye) : 0.5;
+  const blinkRate = M.blinks.length * 60 / clamp(el, 6, 20);
+  const pauseR = avg(A.pauses);
+  const gestureAct = clamp(avg(M.moving) * 3);
+  const rate = A.rate;
+  const f = M.f = {
+    eye, away: 1 - eye, headUp: M.headUp, headDown: 1 - M.headUp,
+    open: M.open, closed: M.closed, gesture: gestureAct, still: 1 - gestureAct,
+    smile: clamp(M.smile * 2.2), tone: clamp(A.range / 8),
+    pace: rate ? 1 - clamp(Math.abs(rate - 4.5) / 3) : 0.5, slow: rate ? clamp((3.2 - rate) / 2) : 0, fast: clamp((rate - 5.5) / 2.5),
+    steady: A.stab, tremor: 1 - A.stab, blink: clamp((blinkRate - 14) / 22),
+    touch: M.touchRecent, lip: M.lipPress, brow: M.brow, shrug: M.shrug, sway: M.swayN,
+    pause: clamp(pauseR * 1.6), longPause: A.longPause, emph: A.emphRecent,
+  };
+  const base = {};
+  for (const st of STATES) {
+    let sum = 0, tw = 0;
+    for (const [k, w] of st.w) { sum += w * (k[0] === '!' ? 1 - f[k.slice(1)] : f[k]); tw += w; }
+    base[st.key] = sum / tw;
+  }
+  // 說話卡頓（停頓比例＋長停頓）多的時候，身體再冷靜也談不上從容：從容、自信打折，壓力往上加
+  const dis = clamp(f.pause * 0.7 + f.longPause * 0.3);
+  base.calm *= 1 - 0.6 * dis; base.conf *= 1 - 0.35 * dis;
+  base.stress += 0.35 * dis * (1 - base.stress);
+  // 拉開各狀態的差距：以平均為中心放大 2.6 倍，六角形才會有明顯的尖角
+  const mean = STATES.reduce((s, st) => s + base[st.key], 0) / STATES.length;
+  for (const st of STATES) M.raw[st.key] = clamp(48 + 100 * (base[st.key] - mean) * 2.6, 6, 97);
+  M.blinkRate = blinkRate; M.eyeR = eye; M.pauseR = pauseR;
+  if (el > 1.2) {
+    if (!M.ready) { M.ready = true; M.disp = {...M.raw}; }
+    M.hist.push({t, ...M.disp});
+  }
+}
+
+// ───────── 鏡頭跟拍 ─────────
+function updateCam() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return;
+  const fit = Math.min(VP.w / vw, VP.h / vh), cover = Math.max(VP.w / vw, VP.h / vh);
+  let tgt;
+  const P = S.subject;
+  if (P && S.phase !== 'idle-wide') {
+    const s = clamp(VP.h / (P.sw * 3.3), cover, cover * 3.2);
+    tgt = S.camTgt = {cx: P.sh.x, cy: P.sh.y + P.sw * 0.25, s};
+  } else if (S.lock && S.camTgt) tgt = S.camTgt;   // 跟丟時鏡頭停在原地等他回來
+  else tgt = {cx: vw / 2, cy: vh / 2, s: fit};
+  if (S.phase === 'orig') { S.cam = {cx: vw / 2, cy: vh / 2, s: fit}; S.camInit = true; return; }
+  if (!S.camInit) { S.cam = {...tgt}; S.camInit = true; }
+  const k = S.phase === 'intro' ? 0.09 : 0.07;
+  S.cam.s = lerp(S.cam.s, tgt.s, k);
+  const hw = VP.w / 2 / S.cam.s, hh = VP.h / 2 / S.cam.s;
+  const cx = hw * 2 >= vw ? vw / 2 : clamp(tgt.cx, hw, vw - hw);
+  const cy = hh * 2 >= vh ? vh / 2 : clamp(tgt.cy, hh, vh - hh);
+  S.cam.cx = lerp(S.cam.cx, cx, k); S.cam.cy = lerp(S.cam.cy, cy, k);
+}
+const V2S = p => ({x: VP.x + VP.w / 2 + (p.x - S.cam.cx) * S.cam.s, y: VP.y + VP.h / 2 + (p.y - S.cam.cy) * S.cam.s});
+const S2V = (x, y) => ({x: S.cam.cx + (x - VP.x - VP.w / 2) / S.cam.s, y: S.cam.cy + (y - VP.y - VP.h / 2) / S.cam.s});
+
+// ───────── 繪圖：共用 ─────────
+function glow(color, blur) { ctx.shadowColor = color; ctx.shadowBlur = blur; }
+function noGlow() { ctx.shadowBlur = 0; }
+function brackets(x, y, w, h, len, color, lw = 3) {
+  ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.beginPath();
+  ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y);
+  ctx.moveTo(x + w - len, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + len);
+  ctx.moveTo(x + w, y + h - len); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w - len, y + h);
+  ctx.moveTo(x + len, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + h - len);
+  ctx.stroke();
+}
+function chamfer(x, y, w, h, c) {
+  ctx.beginPath(); ctx.moveTo(x + c, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + h - c); ctx.lineTo(x + w - c, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + c); ctx.closePath();
+}
+function text(s, x, y, font, color, align = 'left', base = 'alphabetic') {
+  ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = base; ctx.fillText(s, x, y);
+}
+function lines(pts, conns, map, color, lw) {
+  ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.beginPath();
+  for (const {start, end} of conns) {
+    const a = map(pts[start]), b = map(pts[end]);
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+  }
+  ctx.stroke();
+}
+const FACE_PARTS = () => [FaceLandmarker.FACE_LANDMARKS_FACE_OVAL, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, FaceLandmarker.FACE_LANDMARKS_LEFT_EYEBROW, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYEBROW, FaceLandmarker.FACE_LANDMARKS_LIPS];
+
+let scanPattern;
+function makeScanlines() {
+  const c = new OffscreenCanvas(4, 4), x = c.getContext('2d');
+  x.fillStyle = 'rgba(0,0,0,0.22)'; x.fillRect(0, 0, 4, 1);
+  scanPattern = ctx.createPattern(c, 'repeat');
+}
+
+// ───────── 繪圖：上方標題 ─────────
+function drawHeader(now) {
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, VP.y);
+  const blink = Math.floor(now / 600) % 2 === 0;
+  if (S.recording || S.phase === 'play' || S.phase === 'intro') {
+    ctx.fillStyle = blink ? C.red : 'rgba(255,61,90,.35)'; ctx.beginPath(); ctx.arc(52, 48, 9, 0, Math.PI * 2); ctx.fill();
+    text('LIVE', 70, 56, F.num(20, 700), C.red);
+  } else text('READY', 44, 56, F.num(20, 700), C.dim);
+  text('AI BODY LANGUAGE ANALYZER  //  v1.0', 160, 55, F.mono(22), C.cyanD);
+  const dur = video.duration || 0;
+  text(`${fmtT(video.currentTime || 0)} / ${fmtT(dur)}`, W - 44, 55, F.mono(24), C.cyan, 'right');
+  glow(C.cyan, 18);
+  text($('title').value || 'AI 即時肢體語言分析', 44, 138, F.zh(60, 800), C.text);
+  noGlow();
+  // 底線與跑動光條
+  ctx.fillStyle = C.cyanF; ctx.fillRect(44, 172, W - 88, 2);
+  const px = 44 + ((now / 2400) % 1) * (W - 88 - 160);
+  const g = ctx.createLinearGradient(px, 0, px + 160, 0);
+  g.addColorStop(0, 'rgba(45,226,255,0)'); g.addColorStop(0.5, C.cyan); g.addColorStop(1, 'rgba(45,226,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(px, 171, 160, 4);
+}
+
+// ───────── 繪圖：影像區 ─────────
+function drawViewport(now) {
+  ctx.save();
+  ctx.beginPath(); ctx.rect(VP.x, VP.y, VP.w, VP.h); ctx.clip();
+  ctx.fillStyle = '#01050a'; ctx.fillRect(VP.x, VP.y, VP.w, VP.h);
+  // 背景格線（影片沒蓋到的地方看得到）
+  ctx.strokeStyle = 'rgba(45,226,255,.06)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let x = 0; x <= W; x += 60) { ctx.moveTo(x, VP.y); ctx.lineTo(x, VP.y + VP.h); }
+  for (let y = VP.y; y <= VP.y + VP.h; y += 60) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (vw) {
+    const s = S.cam.s, sx0 = S.cam.cx - VP.w / 2 / s, sy0 = S.cam.cy - VP.h / 2 / s;
+    const x0 = Math.max(0, sx0), y0 = Math.max(0, sy0), x1 = Math.min(vw, sx0 + VP.w / s), y1 = Math.min(vh, sy0 + VP.h / s);
+    ctx.imageSmoothingQuality = 'high';
+    ctx.filter = 'contrast(1.12) saturate(0.75) brightness(0.82)';
+    if (x1 > x0 && y1 > y0) ctx.drawImage(video, x0, y0, x1 - x0, y1 - y0, VP.x + (x0 - sx0) * s, VP.y + (y0 - sy0) * s, (x1 - x0) * s, (y1 - y0) * s);
+    ctx.filter = 'none';
+    // 冷色調與暗角
+    ctx.fillStyle = 'rgba(0,40,60,0.22)'; ctx.fillRect(VP.x, VP.y, VP.w, VP.h);
+    const vg = ctx.createRadialGradient(W / 2, VP.y + VP.h * 0.45, VP.h * 0.3, W / 2, VP.y + VP.h * 0.45, VP.h * 0.85);
+    vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,6,12,0.75)');
+    ctx.fillStyle = vg; ctx.fillRect(VP.x, VP.y, VP.w, VP.h);
+    ctx.fillStyle = scanPattern; ctx.fillRect(VP.x, VP.y, VP.w, VP.h);
+  }
+
+  drawOthers();
+  drawSubject(now);
+  drawRipples(now);
+  if (S.face) drawCallouts();
+  drawInset(now);
+  drawEventLog(now);
+
+  // 掃描線
+  const sy = VP.y + ((now / 3200) % 1) * VP.h;
+  const sg = ctx.createLinearGradient(0, sy - 120, 0, sy);
+  sg.addColorStop(0, 'rgba(45,226,255,0)'); sg.addColorStop(1, 'rgba(45,226,255,0.10)');
+  ctx.fillStyle = sg; ctx.fillRect(VP.x, sy - 120, VP.w, 120);
+  ctx.fillStyle = 'rgba(45,226,255,0.45)'; ctx.fillRect(VP.x, sy, VP.w, 1.5);
+
+  // 四角框與刻度
+  brackets(VP.x + 18, VP.y + 18, VP.w - 36, VP.h - 36, 54, C.cyan, 3);
+  ctx.fillStyle = C.cyanD;
+  for (let i = 0; i <= 20; i++) { const y = VP.y + 120 + i * ((VP.h - 240) / 20); ctx.fillRect(VP.x + 26, y, i % 5 ? 8 : 16, 1.5); }
+  text(`ZOOM ${S.cam.s.toFixed(2)}x`, VP.x + 44, VP.y + 58, F.mono(20), C.cyanD);
+  text(S.subject ? 'TRACKING' : (video.videoWidth ? 'SEARCHING' : 'NO SIGNAL'), VP.x + 44, VP.y + 84, F.mono(20), S.subject ? C.green : C.orange);
+
+  if (S.phase === 'idle' && video.videoWidth && !S.recording) {
+    ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(VP.x, VP.y + VP.h - 86, VP.w, 52);
+    text(S.manualLock ? '已鎖定主角，按「錄製成品」開始' : '點一下主角，鎖定分析對象', W / 2, VP.y + VP.h - 51, F.zh(26), C.cyan, 'center');
+  }
+  if (S.phase === 'intro') drawIntro(now);
+  if (S.phase === 'report') drawReport(now);
+  ctx.restore();
+}
+
+function drawOthers() {
+  const P = S.subject;
+  let k = 2;
+  for (const p of S.people) {
+    if (p === P || (P && Math.hypot(p.head.x - P.head.x, p.head.y - P.head.y) < P.sw * 0.6)) continue;
+    const h = V2S(p.head), r = p.sw * 0.45 * S.cam.s;
+    if (h.x < -r || h.x > W + r || h.y < VP.y - r || h.y > VP.y + VP.h + r) continue;
+    brackets(h.x - r, h.y - r, r * 2, r * 2, r * 0.4, 'rgba(160,200,215,.45)', 1.5);
+    text(`OBJ-0${k++}`, h.x - r, h.y - r - 8, F.mono(16), 'rgba(160,200,215,.6)');
+  }
+}
+
+function drawSubject(now) {
+  const P = S.subject;
+  if (!P) return;
+  // 骨架（不含臉）
+  const conns = PoseLandmarker.POSE_CONNECTIONS.filter(c => c.start > 10 && c.end > 10 && P.pts[c.start].v > 0.5 && P.pts[c.end].v > 0.5);
+  glow(C.cyan, 10);
+  lines(P.pts, conns, V2S, 'rgba(45,226,255,.55)', 2.5);
+  ctx.fillStyle = C.cyan;
+  for (let i = 11; i < 33; i++) if (P.pts[i].v > 0.5) { const q = V2S(P.pts[i]); ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, Math.PI * 2); ctx.fill(); }
+  noGlow();
+
+  // 手
+  for (const h of S.hands) {
+    glow(C.green, 10);
+    lines(h, HandLandmarker.HAND_CONNECTIONS, V2S, 'rgba(61,255,176,.85)', 2);
+    ctx.fillStyle = C.green;
+    for (const p of h) { const q = V2S(p); ctx.beginPath(); ctx.arc(q.x, q.y, 2.6, 0, Math.PI * 2); ctx.fill(); }
+    noGlow();
+  }
+
+  // 臉部網格
+  const Fc = S.face;
+  let hb;
+  if (Fc) {
+    lines(Fc.lm, FaceLandmarker.FACE_LANDMARKS_TESSELATION, V2S, 'rgba(45,226,255,.16)', 0.6);
+    glow(C.cyan, 8);
+    for (const part of FACE_PARTS()) lines(Fc.lm, part, V2S, 'rgba(45,226,255,.9)', 1.2);
+    noGlow();
+    drawGaze(Fc, V2S, 1, now);
+    const a = V2S({x: Fc.box.x0, y: Fc.box.y0}), b = V2S({x: Fc.box.x1, y: Fc.box.y1});
+    const pad = (b.x - a.x) * 0.35;
+    hb = {x: a.x - pad, y: a.y - pad, w: b.x - a.x + pad * 2, h: b.y - a.y + pad * 2};
+  } else {
+    const h = V2S(P.head), r = P.sw * 0.55 * S.cam.s;
+    hb = {x: h.x - r, y: h.y - r, w: r * 2, h: r * 2};
+  }
+  S.headBox = hb;
+  const touchHot = M && video.currentTime - M.touchFlash < 0.8 && video.currentTime >= M.touchFlash;
+  const col = touchHot ? C.red : C.cyan;
+  glow(col, 14);
+  brackets(hb.x, hb.y, hb.w, hb.h, Math.min(30, hb.w * 0.25), col, 3);
+  noGlow();
+  // 目標標籤
+  const name = $('name').value.trim();
+  const tag = `TARGET${name ? ' · ' + name : ''}`;
+  ctx.font = F.zh(22, 700);
+  const tw = ctx.measureText(tag).width + 24;
+  ctx.fillStyle = col; ctx.fillRect(hb.x, hb.y - 38, tw, 32);
+  text(tag, hb.x + 12, hb.y - 15, F.zh(22, 700), '#001018');
+  if (touchHot) text('⚠ 摸臉', hb.x + hb.w + 10, hb.y + 24, F.zh(26, 800), C.red);
+}
+
+function drawGaze(Fc, map, scale, now) {
+  const L = Fc.lm;
+  const fw = Math.hypot(L[454].x - L[234].x, L[454].y - L[234].y) || 1;
+  const mid = {x: (L[234].x + L[454].x) / 2, y: (L[234].y + L[454].y) / 2};
+  const head = {x: (L[1].x - mid.x) / fw, y: (L[1].y - mid.y) / fw - 0.05};
+  for (const [iris, c1, c2] of [[468, 33, 133], [473, 362, 263]]) {
+    const I = L[iris], em = {x: (L[c1].x + L[c2].x) / 2, y: (L[c1].y + L[c2].y) / 2};
+    const ew = Math.hypot(L[c1].x - L[c2].x, L[c1].y - L[c2].y) || 1;
+    const dx = head.x * 2.2 + (I.x - em.x) / ew * 3, dy = head.y * 2.2 + (I.y - em.y) / ew * 3;
+    const p = map(I), mag = Math.hypot(dx, dy);
+    ctx.fillStyle = C.orange; glow(C.orange, 10);
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3.2 * scale, 0, Math.PI * 2); ctx.fill();
+    if (mag < 0.22) {
+      ctx.strokeStyle = 'rgba(255,154,61,.8)'; ctx.lineWidth = 1.5;
+      const r = (8 + (now / 120) % 10) * scale;
+      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.stroke();
+    } else {
+      const len = Math.min(1, mag) * 110 * scale, ux = dx / mag, uy = dy / mag;
+      const g = ctx.createLinearGradient(p.x, p.y, p.x + ux * len, p.y + uy * len);
+      g.addColorStop(0, 'rgba(255,154,61,.95)'); g.addColorStop(1, 'rgba(255,154,61,0)');
+      ctx.strokeStyle = g; ctx.lineWidth = 2.2 * scale;
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x + ux * len, p.y + uy * len); ctx.stroke();
+    }
+    noGlow();
+  }
+}
+
+function drawCallouts() {
+  const hb = S.headBox; if (!hb || !M) return;
+  const items = [
+    ['視線', M.gazeLabel],
+    ['表情', M.exprLabel],
+    ['轉頭', `${M.yaw >= 0 ? '+' : ''}${M.yaw.toFixed(0)}°`],
+  ];
+  const right = hb.x + hb.w / 2 > W - 360;
+  const x = right ? hb.x - 250 : Math.max(40, hb.x - 250);
+  const useLeft = hb.x - 250 > 30;
+  const bx = useLeft ? hb.x - 250 : hb.x + hb.w + 30;
+  items.forEach(([k, v], i) => {
+    const y = hb.y + 10 + i * 50;
+    ctx.fillStyle = 'rgba(2,12,20,.72)'; chamfer(bx, y, 210, 40, 8); ctx.fill();
+    ctx.strokeStyle = C.cyanD; ctx.lineWidth = 1; chamfer(bx, y, 210, 40, 8); ctx.stroke();
+    text(k, bx + 12, y + 27, F.zh(18), C.dim);
+    text(v, bx + 198, y + 28, F.zh(21, 700), C.text, 'right');
+    ctx.strokeStyle = C.cyanD; ctx.beginPath();
+    if (useLeft) { ctx.moveTo(bx + 210, y + 20); ctx.lineTo(hb.x - 4, hb.y + 20 + i * 12); }
+    else { ctx.moveTo(bx, y + 20); ctx.lineTo(hb.x + hb.w + 4, hb.y + 20 + i * 12); }
+    ctx.stroke();
+  });
+}
+
+function drawInset(now) {
+  const x = 770, y = VP.y + 40, s = 270;
+  ctx.fillStyle = 'rgba(2,10,18,.85)'; ctx.fillRect(x, y, s, s + 34);
+  text('FACE SCAN · 478 PTS', x + 10, y + 24, F.mono(18), C.cyan);
+  const iy = y + 34;
+  if (S.face && S.headCrop) {
+    // 只取臉的範圍放大
+    let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+    for (const p of S.face.lmC) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
+    const tz = {cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, cs: Math.max(x1 - x0, y1 - y0) * 1.45};
+    const z = S.insetZ = S.insetZ ? {cx: lerp(S.insetZ.cx, tz.cx, 0.25), cy: lerp(S.insetZ.cy, tz.cy, 0.25), cs: lerp(S.insetZ.cs, tz.cs, 0.25)} : tz;
+    const ox = z.cx - z.cs / 2, oy = z.cy - z.cs / 2;
+    ctx.save(); ctx.beginPath(); ctx.rect(x, iy, s, s); ctx.clip();
+    ctx.filter = 'contrast(1.15) saturate(0.6) brightness(0.75)';
+    ctx.drawImage(headCv, ox * 256, oy * 256, z.cs * 256, z.cs * 256, x, iy, s, s);
+    ctx.filter = 'none';
+    ctx.fillStyle = 'rgba(0,40,60,.3)'; ctx.fillRect(x, iy, s, s);
+    const map = p => ({x: x + (p.x - ox) / z.cs * s, y: iy + (p.y - oy) / z.cs * s});
+    lines(S.face.lmC, FaceLandmarker.FACE_LANDMARKS_TESSELATION, map, 'rgba(45,226,255,.35)', 0.7);
+    glow(C.cyan, 6);
+    for (const part of FACE_PARTS()) lines(S.face.lmC, part, map, C.cyan, 1.4);
+    noGlow();
+    ctx.fillStyle = 'rgba(255,255,255,.75)';
+    for (let i = 0; i < 468; i += 7) { const q = map(S.face.lmC[i]); ctx.fillRect(q.x - 0.8, q.y - 0.8, 1.6, 1.6); }
+    drawGaze({lm: S.face.lmC}, map, 1.6, now);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = 'rgba(45,226,255,.05)'; ctx.fillRect(x, iy, s, s);
+    text('SEARCHING…', x + s / 2, iy + s / 2, F.mono(22), C.cyanD, 'center', 'middle');
+  }
+  brackets(x, iy, s, s, 22, C.cyan, 2);
+  // 數值
+  if (M) {
+    const rows = [['YAW', `${M.yaw >= 0 ? '+' : ''}${M.yaw.toFixed(1)}°`], ['PITCH', `${M.pitch >= 0 ? '+' : ''}${M.pitch.toFixed(1)}°`], ['BLINK', `${M.ready ? Math.round(M.blinkRate || 0) : '--'}/min`]];
+    rows.forEach(([k, v], i) => {
+      const ry = iy + s + 12 + i * 30;
+      ctx.fillStyle = 'rgba(2,10,18,.75)'; ctx.fillRect(x, ry, s, 26);
+      text(k, x + 10, ry + 19, F.mono(18), C.dim);
+      text(v, x + s - 10, ry + 19, F.mono(19), C.cyan, 'right');
+    });
+  }
+}
+
+function drawRipples(now) {
+  if (!M) return;
+  M.ripples = M.ripples.filter(r => now - r.born < 700);
+  for (const r of M.ripples) {
+    const k = (now - r.born) / 700, p = V2S(r);
+    ctx.strokeStyle = `rgba(45,226,255,${1 - k})`; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 10 + k * 60, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+
+function drawEventLog(now) {
+  if (!M) return;
+  const list = M.events.filter(e => now - e.born < 7000).slice(-4);
+  const x = VP.x + 44, y0 = VP.y + VP.h - 70;
+  list.reverse().forEach((e, i) => {
+    const a = clamp(1 - (now - e.born - 5500) / 1500) * (i === 0 ? 1 : 0.8);
+    const y = y0 - i * 46;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(2,10,18,.78)'; ctx.fillRect(x, y - 30, 420, 38);
+    ctx.fillStyle = e.color; ctx.fillRect(x, y - 30, 5, 38);
+    text(fmtT(e.t), x + 16, y - 4, F.mono(19), C.dim);
+    text(e.text, x + 106, y - 4, F.zh(21, 700), e.color);
+    ctx.globalAlpha = 1;
+  });
+}
+
+function drawIntro(now) {
+  const k = clamp((now - S.phaseStart) / (INTRO_SEC * 1000));
+  ctx.fillStyle = `rgba(0,8,14,${0.55 * (1 - k * 0.6)})`; ctx.fillRect(VP.x, VP.y, VP.w, VP.h);
+  const target = S.headBox ? {x: S.headBox.x + S.headBox.w / 2, y: S.headBox.y + S.headBox.h / 2} : {x: W / 2, y: VP.y + VP.h / 2};
+  const r = lerp(380, (S.headBox?.w || 120) * 0.7, 1 - Math.pow(1 - k, 3));
+  ctx.save(); ctx.translate(target.x, target.y); ctx.rotate(now / 500);
+  ctx.strokeStyle = C.cyan; ctx.lineWidth = 2; glow(C.cyan, 16);
+  for (let i = 0; i < 4; i++) { ctx.beginPath(); ctx.arc(0, 0, r, i * Math.PI / 2 + 0.2, i * Math.PI / 2 + 1.2); ctx.stroke(); }
+  ctx.rotate(-now / 250);
+  ctx.setLineDash([4, 10]); ctx.beginPath(); ctx.arc(0, 0, r * 1.25, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+  noGlow(); ctx.restore();
+  ctx.strokeStyle = C.cyanD; ctx.beginPath(); ctx.moveTo(target.x - r * 1.5, target.y); ctx.lineTo(target.x + r * 1.5, target.y); ctx.moveTo(target.x, target.y - r * 1.5); ctx.lineTo(target.x, target.y + r * 1.5); ctx.stroke();
+  const msg = k < 0.45 ? '掃描畫面中的人物…' : k < 0.8 ? '鎖定分析對象…' : '建立臉部 478 點模型…';
+  glow(C.cyan, 12);
+  text(msg, W / 2, VP.y + VP.h - 120, F.zh(34, 700), C.cyan, 'center');
+  noGlow();
+  ctx.fillStyle = C.cyanF; ctx.fillRect(W / 2 - 220, VP.y + VP.h - 95, 440, 6);
+  ctx.fillStyle = C.cyan; ctx.fillRect(W / 2 - 220, VP.y + VP.h - 95, 440 * k, 6);
+}
+
+// ───────── 結尾報告 ─────────
+function summary() {
+  const h = M.hist, avgs = {};
+  for (const st of STATES) avgs[st.key] = h.length ? h.reduce((s, o) => s + (o[st.key] ?? 0), 0) / h.length : 0;
+  const ranked = STATES.slice().sort((a, b) => avgs[b.key] - avgs[a.key]);
+  const [top1, top2] = ranked;
+  const peak = h.reduce((b, o) => (o.stress ?? 0) > b.v ? {v: o.stress, t: o.t} : b, {v: -1, t: 0});
+  const label = `${top1.zh}為主${avgs[top2.key] > 40 ? `，帶點${top2.zh}` : ''}`;
+  return {avgs, top1, top2, peak, label, line: top1.line};
+}
+let report;
+function drawReport(now) {
+  if (!report) report = summary();
+  const k = clamp((now - S.phaseStart) / 900), e = 1 - Math.pow(1 - k, 3);
+  ctx.fillStyle = `rgba(0,8,14,${0.85 * e})`; ctx.fillRect(VP.x, VP.y, VP.w, VP.h);
+  const x = 70, y = VP.y + 50, w = W - 140;
+  ctx.globalAlpha = e;
+  text('ANALYSIS COMPLETE', x, y + 20, F.num(24, 700), C.cyan);
+  text('分析完成', x, y + 74, F.zh(46, 800), C.text);
+  ctx.fillStyle = C.cyanF; ctx.fillRect(x, y + 96, w, 2);
+  text('整體判讀', x, y + 140, F.zh(24), C.dim);
+  glow(report.top1.col, 20);
+  text(report.label, x, y + 210, F.zh(62, 900), report.top1.col);
+  noGlow();
+  text(report.line, x, y + 258, F.zh(28, 600), C.text);
+  // 六種狀態平均
+  STATES.forEach((st, i) => {
+    const by = y + 310 + i * 46, bx = x + 110, bw = w - 200, v = report.avgs[st.key] * e;
+    text(st.zh, x, by + 14, F.zh(26, 800), st.col);
+    ctx.fillStyle = 'rgba(45,226,255,.1)'; ctx.fillRect(bx, by - 6, bw, 16);
+    glow(st.col, 10); ctx.fillStyle = st.col; ctx.fillRect(bx, by - 6, bw * v / 100, 16); noGlow();
+    text(`${Math.round(v)}%`, x + w, by + 14, F.num(28, 700), C.text, 'right');
+  });
+  // 關鍵次數
+  const counts = [['摸臉', M.touches, C.red], ['手勢強調', M.gestures, C.cyan], ['真笑', M.smiles, C.green], ['長停頓', M.longPauses, C.violet]];
+  counts.forEach(([kk, v, col], i) => {
+    const cx = x + i * (w / 4);
+    text(kk, cx, y + 610, F.zh(22), C.dim);
+    text(`${v}`, cx, y + 658, F.num(42, 700), col);
+    text('次', cx + 14 + String(v).length * 30, y + 656, F.zh(20), C.dim);
+  });
+  // 時間軸：前兩名狀態＋壓力
+  const gx = x, gy = y + 710, gw = w, gh = 150;
+  ctx.strokeStyle = C.cyanF; ctx.lineWidth = 1; ctx.strokeRect(gx, gy, gw, gh);
+  const lineSt = [report.top1, report.top2, STATES[1]].filter((st, i, a) => a.indexOf(st) === i);
+  text(lineSt.map(st => st.zh).join(' / ') + ' 變化', gx, gy - 12, F.zh(20), C.dim);
+  const h = M.hist, t0 = h[0]?.t ?? 0, t1 = h.at(-1)?.t ?? 1;
+  for (const st of lineSt) {
+    ctx.strokeStyle = st.col; ctx.lineWidth = 3; glow(st.col, 8); ctx.beginPath();
+    const n = Math.floor(h.length * e);
+    for (let i = 0; i < n; i++) {
+      const px = gx + (h[i].t - t0) / Math.max(0.1, t1 - t0) * gw, py = gy + gh - (h[i][st.key] ?? 0) / 100 * gh;
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    }
+    ctx.stroke(); noGlow();
+  }
+  if (report.peak.v > 0 && k >= 1) {
+    const px = gx + (report.peak.t - t0) / Math.max(0.1, t1 - t0) * gw, py = gy + gh - report.peak.v / 100 * gh;
+    ctx.fillStyle = C.red; ctx.beginPath(); ctx.arc(px, py, 7, 0, Math.PI * 2); ctx.fill();
+    text(`壓力最高 ${fmtT(report.peak.t)}`, clamp(px, gx + 100, gx + gw - 100), py - 14, F.zh(20, 700), C.red, 'center');
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ───────── 繪圖：儀表板 ─────────
+function gauge(cx, cy, r, val, label, en, col, ready, now) {
+  const a0 = Math.PI * 0.75, sweep = Math.PI * 1.5;
+  // 刻度
+  for (let i = 0; i <= 50; i++) {
+    const a = a0 + sweep * i / 50, on = ready && i / 50 <= val / 100;
+    ctx.strokeStyle = on ? col : 'rgba(45,226,255,.15)'; ctx.lineWidth = i % 5 ? 2 : 4;
+    const r1 = r + 14, r2 = r + (i % 5 ? 24 : 32);
+    ctx.beginPath(); ctx.moveTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); ctx.lineTo(cx + Math.cos(a) * r2, cy + Math.sin(a) * r2); ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(45,226,255,.1)'; ctx.lineWidth = 16; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(cx, cy, r, a0, a0 + sweep); ctx.stroke();
+  if (ready) {
+    glow(col, 22); ctx.strokeStyle = col;
+    ctx.beginPath(); ctx.arc(cx, cy, r, a0, a0 + sweep * val / 100); ctx.stroke(); noGlow();
+  }
+  ctx.lineCap = 'butt';
+  // 內圈旋轉虛線
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(now / 3000 * (col === C.cyan ? 1 : -1));
+  ctx.setLineDash([3, 9]); ctx.strokeStyle = 'rgba(45,226,255,.3)'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(0, 0, r - 26, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]); ctx.restore();
+  glow(col, 16);
+  text(ready ? String(Math.round(val)) : '--', cx - 8, cy + 26, F.num(86, 900), C.text, 'center');
+  noGlow();
+  text('%', cx + (ready && val >= 10 ? 62 : 44), cy + 24, F.num(28, 700), col, 'left');
+  text(label, cx, cy + 92, F.zh(32, 800), col, 'center');
+  text(en, cx, cy + 124, F.mono(18), C.dim, 'center');
+}
+
+function drawDashboard(now) {
+  ctx.fillStyle = C.bg; ctx.fillRect(0, DY, W, H - DY);
+  ctx.fillStyle = C.cyanF; ctx.fillRect(0, DY, W, 2);
+  const ready = M && M.ready && S.phase !== 'intro';
+  if (M && M.ready) for (const st of STATES) M.disp[st.key] = lerp(M.disp[st.key] ?? M.raw[st.key], M.raw[st.key], 0.05);
+  const val = k => ready ? (M.disp[k] ?? 0) : 0;
+
+  // 六角雷達圖
+  const rx = 290, ry = DY + 232, R = 165, n = STATES.length;
+  const ang = i => -Math.PI / 2 + i * 2 * Math.PI / n;
+  const pt = (i, r) => ({x: rx + Math.cos(ang(i)) * r, y: ry + Math.sin(ang(i)) * r});
+  ctx.strokeStyle = 'rgba(45,226,255,.16)'; ctx.lineWidth = 1;
+  for (const fr of [0.25, 0.5, 0.75, 1]) {
+    ctx.beginPath();
+    for (let i = 0; i <= n; i++) { const q = pt(i % n, R * fr); i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y); }
+    ctx.stroke();
+  }
+  for (let i = 0; i < n; i++) { const q = pt(i, R); ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(q.x, q.y); ctx.stroke(); }
+  // 旋轉掃描線
+  const sa = now / 1400;
+  const sg = ctx.createLinearGradient(rx, ry, rx + Math.cos(sa) * R, ry + Math.sin(sa) * R);
+  sg.addColorStop(0, 'rgba(45,226,255,0)'); sg.addColorStop(1, 'rgba(45,226,255,.55)');
+  ctx.strokeStyle = sg; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(rx + Math.cos(sa) * R, ry + Math.sin(sa) * R); ctx.stroke();
+  if (ready) {
+    ctx.beginPath();
+    STATES.forEach((st, i) => { const q = pt(i, R * val(st.key) / 100); i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y); });
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(45,226,255,.16)'; ctx.fill();
+    glow(C.cyan, 16); ctx.strokeStyle = C.cyan; ctx.lineWidth = 2.5; ctx.stroke(); noGlow();
+    STATES.forEach((st, i) => { const q = pt(i, R * val(st.key) / 100); glow(st.col, 12); ctx.fillStyle = st.col; ctx.beginPath(); ctx.arc(q.x, q.y, 6, 0, Math.PI * 2); ctx.fill(); noGlow(); });
+  }
+  STATES.forEach((st, i) => { const q = pt(i, R + 36); text(st.zh, q.x, q.y + 9, F.zh(25, 800), st.col, 'center'); });
+
+  // 右側：六種狀態分數
+  const lx = 560, lw = W - 44 - lx;
+  STATES.forEach((st, i) => {
+    const y = DY + 62 + i * 66;
+    text(st.zh, lx, y, F.zh(27, 800), st.col);
+    text(st.en, lx + 70, y - 2, F.mono(15), C.dim);
+    text(ready ? String(Math.round(val(st.key))) : '--', lx + lw - 30, y + 2, F.num(36, 700), C.text, 'right');
+    text('%', lx + lw, y, F.num(18, 700), st.col, 'right');
+    ctx.fillStyle = 'rgba(45,226,255,.1)'; ctx.fillRect(lx, y + 16, lw, 6);
+    glow(st.col, 8); ctx.fillStyle = st.col; ctx.fillRect(lx, y + 16, lw * val(st.key) / 100, 6); noGlow();
+  });
+
+  // 主導狀態
+  const by = DY + 470;
+  ctx.fillStyle = 'rgba(6,24,36,.8)'; chamfer(44, by, W - 88, 62, 14); ctx.fill();
+  ctx.strokeStyle = C.cyanD; ctx.lineWidth = 1.5; chamfer(44, by, W - 88, 62, 14); ctx.stroke();
+  text('主導狀態', 68, by + 40, F.zh(22), C.dim);
+  if (ready) {
+    const rk = STATES.slice().sort((a, b) => val(b.key) - val(a.key));
+    glow(rk[0].col, 14); text(`▶ ${rk[0].zh}`, 180, by + 43, F.zh(34, 900), rk[0].col); noGlow();
+    text(`次要　${rk[1].zh}・${rk[2].zh}`, W - 68, by + 40, F.zh(24, 700), C.text, 'right');
+  } else text('分析中…', 180, by + 42, F.zh(30, 700), C.cyanD);
+
+  // 底層數據
+  const f = M?.f ?? {}, sway = M?.swayN ?? 0;
+  const chips = [
+    ['眼神接觸', ready ? `${Math.round((f.eye ?? 0) * 100)}%` : '--'],
+    ['眨眼', ready ? `${Math.round(M.blinkRate)} 次/分` : '--'],
+    ['語速', ready && A.rate ? `${A.rate.toFixed(1)} 字/秒` : '--'],
+    ['停頓比例', ready ? `${Math.round(M.pauseR * 100)}%` : '--'],
+    ['手勢強調', ready ? `${M.gestures} 次` : '--'],
+    ['摸臉', ready ? `${M.touches} 次` : '--'],
+    ['語調起伏', ready ? `${A.range.toFixed(1)} 半音` : '--'],
+    ['身體晃動', ready ? (sway > 0.6 ? '高' : sway > 0.3 ? '中' : '低') : '--'],
+  ];
+  const cw = (W - 88 - 36) / 4, ch = 56;
+  chips.forEach(([k, v], i) => {
+    const cx = 44 + (i % 4) * (cw + 12), cy = DY + 552 + Math.floor(i / 4) * (ch + 10);
+    ctx.fillStyle = 'rgba(6,24,36,.75)'; chamfer(cx, cy, cw, ch, 10); ctx.fill();
+    ctx.strokeStyle = 'rgba(45,226,255,.22)'; ctx.lineWidth = 1; chamfer(cx, cy, cw, ch, 10); ctx.stroke();
+    text(k, cx + 14, cy + 22, F.zh(17), C.dim);
+    text(v, cx + 14, cy + 47, F.mono(23), C.cyan);
+  });
+
+  // 聲紋
+  const wy = DY + 712, wh = 34;
+  text('VOICE', 44, wy + 6, F.mono(17), C.dim);
+  text(A.f0 ? `${Math.round(A.f0)} Hz` : '— Hz', W - 44, wy + 6, F.mono(17), C.cyan, 'right');
+  glow(C.cyan, 8); ctx.strokeStyle = C.cyan; ctx.lineWidth = 2; ctx.beginPath();
+  for (let i = 0; i < 240; i++) {
+    const v = A.wave[Math.floor(i / 240 * A.wave.length)] || 0;
+    const px = 130 + i / 239 * (W - 320), py = wy + clamp(v * 1.6, -1, 1) * wh * 0.5;
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  }
+  ctx.stroke(); noGlow();
+
+  // 頁尾
+  text('MediaPipe · FACE 478 / HAND 21 / POSE 33', 44, H - 12, F.mono(15), 'rgba(111,151,166,.7)');
+  const handle = $('handle').value.trim();
+  if (handle) text(handle, W - 44, H - 12, F.zh(22, 700), C.text, 'right');
+}
+
+// ───────── 主迴圈 ─────────
+function render(now) {
+  if (S.phase === 'orig') { drawOriginal(now); return; }
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  drawViewport(now);
+  drawHeader(now);
+  drawDashboard(now);
+  // 切進分析畫面的白光
+  if (S.phase === 'intro') {
+    const fk = clamp(1 - (now - S.phaseStart) / 220);
+    if (fk > 0) { ctx.fillStyle = `rgba(220,250,255,${fk * 0.85})`; ctx.fillRect(0, 0, W, H); }
+  }
+}
+// 開頭原始畫面：不加任何特效，讓觀眾先認出是誰；最後 0.3 秒故障閃爍轉場
+function drawOriginal(now) {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return;
+  const fit = Math.min(W / vw, H / vh), cover = Math.max(W / vw, H / vh);
+  const same = Math.abs(vw / vh - W / H) < 0.02;
+  if (!same) {   // 橫式影片：背景放模糊放大版，中間放完整畫面
+    ctx.filter = 'blur(40px) brightness(0.45)';
+    ctx.drawImage(video, (W - vw * cover) / 2, (H - vh * cover) / 2, vw * cover, vh * cover);
+    ctx.filter = 'none';
+  }
+  const s = same ? cover : fit;
+  ctx.drawImage(video, (W - vw * s) / 2, (H - vh * s) / 2, vw * s, vh * s);
+  ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(44, 60, 186, 46);
+  ctx.fillStyle = C.red; ctx.beginPath(); ctx.arc(66, 83, 7, 0, Math.PI * 2); ctx.fill();
+  text('原始畫面', 84, 93, F.zh(26, 700), '#fff');
+  const left = ORIG_SEC - video.currentTime;
+  if (left < 0.3) {
+    const k = clamp(1 - left / 0.3), seed = Math.floor(now / 33);
+    const rnd = i => { const x = Math.sin(i * 12.9898 + seed * 78.233) * 43758.5453; return x - Math.floor(x); };
+    for (let i = 0; i < 4 + k * 10; i++) {
+      const y = rnd(i) * H, h = 20 + rnd(i + 50) * 90, dx = (rnd(i + 99) - 0.5) * 120 * k;
+      ctx.drawImage(canvas, 0, y, W, h, dx, y, W, h);
+    }
+    ctx.fillStyle = `rgba(45,226,255,${0.25 * k})`; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = scanPattern; ctx.fillRect(0, 0, W, H);
+  }
+}
+function frame() {
+  requestAnimationFrame(frame);
+  if (S.offline) return;
+  const now = performance.now();
+  if (face && video.videoWidth && (video.currentTime !== S.lastVT || S.needDetect)) { S.needDetect = false; detect(); }
+  if (!video.paused) audioTick(video.currentTime);
+  updateCam();
+  render(now);
+}
+
+// ───────── 逐格輸出（不管電腦快慢，成品都是順暢的 30fps）─────────
+async function renderOffline() {
+  const FPS = 30, OUTRO = 5.5;
+  ['play', 'relock', 'record'].forEach(id => $(id).disabled = true);
+  setStatus('準備中…');
+  const srcBlob = await (await fetch(video.src)).blob();
+  try {
+    const buf = await new OfflineAudioContext(1, 1, 48000).decodeAudioData(await srcBlob.arrayBuffer());
+    const pcm = new Float32Array(buf.length);
+    for (let c = 0; c < buf.numberOfChannels; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) pcm[i] += d[i] / buf.numberOfChannels; }
+    A.pcm = pcm; A.sr = buf.sampleRate;
+  } catch { A.pcm = null; }
+  const job = await (await fetch('/job/start', {method: 'POST'})).text();
+  await fetch(`/job/${job}/source`, {method: 'POST', body: srcBlob});
+
+  video.pause();
+  const seekTo = async t => {
+    if (Math.abs(video.currentTime - t) < 1e-4) return;
+    const p = new Promise(r => video.addEventListener('seeked', r, {once: true}));
+    video.currentTime = t; await p;
+  };
+  await seekTo(0);
+  S.offline = true; S.recording = true; S.vclock = 0;
+  resetMetrics(); report = null; S.insetZ = null;
+  S.lock = S.lockInit ? {...S.lockInit} : null; S.subject = null; S.face = null; S.headCrop = S.bodyCrop = null; S.camInit = false; S.lastVT = -1;
+  S.refSig = S.refSw = S.camTgt = null; S.lost = 0;
+
+  const nOrig = Math.round(ORIG_SEC * FPS), nIntro = Math.round(INTRO_SEC * FPS);
+  const nPlay = Math.floor(video.duration * FPS), nOut = Math.round(OUTRO * FPS);
+  const total = nPlay + nOut;
+  const pending = new Set();
+  let i = 0;
+  const send = async () => {
+    const b = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.93));
+    const p = fetch(`/job/${job}/frame/${i}`, {method: 'POST', body: b}).finally(() => pending.delete(p));
+    pending.add(p);
+    if (pending.size > 6) await Promise.race(pending);
+    if (i % 15 === 0) setStatus(`逐格輸出中… ${i} / ${total}（${Math.round(i / total * 100)}%）<br>完成前請不要關掉這個分頁`);
+  };
+
+  S.phase = 'orig'; S.phaseStart = 0;
+  for (let k = 0; k < nPlay; k++, i++) {
+    S.vclock = i * 1000 / FPS;
+    if (k === nOrig) { S.phase = 'intro'; S.phaseStart = S.vclock; }
+    if (k === nOrig + nIntro) S.phase = 'play';
+    const t = k / FPS;
+    await seekTo(t);
+    detect(); audioTick(t); updateCam(); render(S.vclock); await send();
+  }
+  S.phase = 'report'; S.phaseStart = i * 1000 / FPS;
+  A.wave.fill(0); A.f0 = 0;
+  for (let k = 0; k < nOut; k++, i++) {
+    S.vclock = i * 1000 / FPS;
+    updateCam(); render(S.vclock); await send();
+  }
+  await Promise.all(pending);
+  setStatus('合成影片中…');
+  const name = `AI分析-${$('name').value.trim() || '演講'}`;
+  const saved = await (await fetch(`/job/${job}/finish?fps=${FPS}&delay=0&name=${encodeURIComponent(name)}`, {method: 'POST'})).text();
+  S.offline = false; S.recording = false;
+  ['play', 'relock', 'record'].forEach(id => $(id).disabled = false);
+  window.__lastRecording = {saved, frames: total};
+  setStatus(`完成 ✓ 已存到：<br>${saved}`);
+}
+
+// ───────── 操作 ─────────
+function loadSrc(url, name) {
+  video.src = url; video.load();
+  S.lock = S.lockInit = null; S.manualLock = false; S.subject = null; S.face = null; S.camInit = false; S.headCrop = S.bodyCrop = null;
+  S.refSig = S.refSw = S.camTgt = null;
+  resetMetrics(); report = null; S.phase = 'idle';
+  setStatus(`已載入：${name}，正在找畫面裡的人…`);
+}
+video.addEventListener('loadeddata', () => { S.needDetect = true; ['play', 'relock', 'record'].forEach(id => $(id).disabled = false); setStatus('點一下畫面裡的主角，鎖定分析對象'); });
+video.addEventListener('seeked', () => { S.needDetect = true; });
+
+$('drop').onclick = () => $('file').click();
+$('file').onchange = e => { const f = e.target.files[0]; if (f) loadSrc(URL.createObjectURL(f), f.name); };
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) loadSrc(URL.createObjectURL(f), f.name); });
+
+canvas.addEventListener('click', e => {
+  if (!video.videoWidth || S.recording) return;
+  const rc = canvas.getBoundingClientRect();
+  const x = (e.clientX - rc.left) / rc.width * W, y = (e.clientY - rc.top) / rc.height * H;
+  if (y < VP.y || y > VP.y + VP.h) return;
+  lockAt(S2V(x, y));
+});
+function lockAt(v) {
+  let best = null, bd = Infinity;
+  for (const p of S.people) { const d = Math.hypot(p.head.x - v.x, p.head.y - v.y); if (d < bd) { bd = d; best = p; } }
+  const pt = best && bd < best.sw * 3 ? best.head : v;
+  S.lock = {...pt}; S.lockInit = {...pt}; S.manualLock = true; S.refSig = S.refSw = S.camTgt = null; S.subject = null; S.face = null; S.headCrop = S.bodyCrop = null; S.needDetect = true;
+  setStatus('已鎖定主角 ✓ 可以按「錄製成品」了');
+}
+$('relock').onclick = () => {
+  S.lock = S.lockInit = null; S.manualLock = false; S.subject = null; S.face = null; S.headCrop = S.bodyCrop = null;
+  S.refSig = S.refSw = S.camTgt = null;
+  S.phase = 'idle'; video.pause(); S.needDetect = true;
+  S.camInit = false;
+  setStatus('已取消鎖定，再點一次主角');
+};
+$('play').onclick = async () => {
+  ensureAudio(); await A.ctx.resume();
+  if (video.paused) {
+    if (video.ended || S.phase === 'report') { video.currentTime = 0; resetMetrics(); report = null; }
+    S.phase = 'play'; video.play(); $('play').textContent = '❚❚ 暫停';
+  } else { video.pause(); S.phase = 'idle'; $('play').textContent = '▶ 預覽'; }
+};
+video.addEventListener('ended', () => {
+  S.phase = 'report'; S.phaseStart = performance.now(); $('play').textContent = '▶ 預覽';
+});
+
+function pickMime() {
+  for (const m of ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'])
+    if (MediaRecorder.isTypeSupported(m)) return m;
+  return '';
+}
+const waitSeek = () => new Promise(r => video.addEventListener('seeked', r, {once: true}));
+async function startRecording() {
+  if (S.recording) return;
+  ensureAudio(); await A.ctx.resume();
+  ['play', 'relock', 'record'].forEach(id => $(id).disabled = true);
+  video.pause(); video.currentTime = 0; await waitSeek();
+  resetMetrics(); report = null;
+  S.lock = S.lockInit ? {...S.lockInit} : null; S.subject = null; S.face = null; S.headCrop = S.bodyCrop = null; S.camInit = false;
+  S.phase = 'idle'; detect(); detect();
+  const stream = canvas.captureStream(30);
+  A.dest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
+  const mime = pickMime();
+  const rec = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: 16_000_000, audioBitsPerSecond: 192_000});
+  const chunks = [];
+  rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+  rec.onstop = () => finishRecording(new Blob(chunks, {type: mime}), mime);
+  rec.start(500);
+  S.recording = true; S.phase = 'orig'; S.phaseStart = performance.now(); video.play();
+  setStatus('● 錄製中…播完會自動存檔，期間請不要切換分頁');
+  setTimeout(() => { S.phase = 'intro'; S.phaseStart = performance.now(); }, ORIG_SEC * 1000);
+  setTimeout(() => { S.phase = 'play'; }, (ORIG_SEC + INTRO_SEC) * 1000);
+  video.addEventListener('ended', () => setTimeout(() => rec.stop(), 5500), {once: true});
+}
+async function finishRecording(blob, mime) {
+  S.recording = false;
+  ['play', 'relock', 'record'].forEach(id => $(id).disabled = false);
+  const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+  const name = `AI分析-${$('name').value.trim() || '演講'}`;
+  const url = URL.createObjectURL(blob);
+  let saved = '';
+  if (location.protocol.startsWith('http')) {
+    try { const r = await fetch(`/save?ext=${ext}&name=${encodeURIComponent(name)}`, {method: 'POST', body: blob}); if (r.ok) saved = await r.text(); } catch {}
+  }
+  window.__lastRecording = {size: blob.size, mime, saved};
+  setStatus(`錄好了 ✓（${(blob.size / 1e6).toFixed(1)} MB）${saved ? `<br>已存到：${saved}` : ''}<br><a href="${url}" download="${name}.${ext}">⬇ 下載影片</a>`);
+  if (!saved) { const a = document.createElement('a'); a.href = url; a.download = `${name}.${ext}`; a.click(); }
+}
+// 有本機伺服器就逐格輸出；直接開檔案（沒有伺服器）才用即時錄影
+$('record').onclick = () => location.protocol.startsWith('http') ? renderOffline().catch(err => {
+  S.offline = false; S.recording = false;
+  ['play', 'relock', 'record'].forEach(id => $(id).disabled = false);
+  setStatus('輸出失敗：' + err.message);
+}) : startRecording();
+
+// ───────── 啟動 ─────────
+resetMetrics();
+makeScanlines();
+requestAnimationFrame(frame);
+Promise.all([document.fonts.load(F.num(40)), document.fonts.load(F.mono(20))]).catch(() => {});
+loadModels().then(() => {
+  setStatus(video.src ? '模型載入完成 ✓' : '模型載入完成 ✓ 把影片拖進來吧');
+  S.needDetect = true;
+  const q = new URLSearchParams(location.search);
+  // 測試用：整支先載進記憶體，逐格跳轉才快
+  if (q.get('name')) $('name').value = q.get('name');
+  if (q.get('title')) $('title').value = q.get('title');
+  if (q.get('handle')) $('handle').value = q.get('handle');
+  if (q.get('src') && !video.src) fetch(q.get('src')).then(r => r.blob()).then(b => {
+    loadSrc(URL.createObjectURL(b), q.get('src'));
+    // ?auto=1：載入後自動鎖定並輸出（給背景批次用）
+    if (q.get('auto')) video.addEventListener('loadeddata', () => setTimeout(async () => {
+      const lk = q.get('lock');
+      detect(); detect();
+      if (lk) { const [x, y] = lk.split(',').map(Number); lockAt({x: x * video.videoWidth, y: y * video.videoHeight}); }
+      for (let k = 0; k < 5; k++) detect();
+      renderOffline().catch(err => { window.__lastRecording = {error: err.message}; });
+    }, 300), {once: true});
+  });
+}).catch(err => setStatus('模型載入失敗：' + err.message));
+
+window.HUD = {S, get M() { return M; }, A, lockAt, startRecording, video, detect, sigDist};
+</script>
+</body>
+</html>
